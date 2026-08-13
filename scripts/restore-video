@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# restore-video —— 视频修复，在控制端敲，自动借用 GPU 节点的算力。
+#
+#   restore-video <输入文件或目录> [输出目录]
+#
+# 输出目录可省，默认当前目录下的 restored/。输出文件名沿用输入的主名；
+# **容器（.mp4 / .mkv）按源的流内容自动判定**，不由这里预设。输入是目录时子目录结构原样保留。
+#
+# 例：
+#   restore-video old.mkv                          -> ./restored/old.mp4 或 .mkv
+#   restore-video old.mkv /path/to/out             -> /path/to/out/old.{mp4|mkv}
+#   restore-video '/path/to/series'                -> ./restored/... 递归批处理
+#   restore-video --dry-run '/path/to/library'     -> 只列出会处理哪些，不动手
+#
+# 选项：
+#   --dry-run       只列出待处理清单与输出路径
+#   --no-recursive  目录输入时不递归子目录
+#
+# 做的事，按顺序：
+#   ① 唤醒 GPU 节点（睡着约 15 s），置 keep-awake 防止中途休眠
+#   ② 逐个：上传 → 在容器里跑修复链 → 取回本机 → 删该文件的远端暂存
+#   ③ 全部结束后撤 keep-awake
+#
+# 修复链：源分析 → 场处理(自动) → DPIR 去压缩伪影 → 非方形像素校正
+#         → 2xLiveActionV1_SPAN 超分 → BT.709 → HEVC 10-bit（预设可选档位）
+#
+# 固定用 SPAN。横评结论：更大的 RealPLKSR 慢 23 倍且画质更差
+# （训练域是照片+JPEG，不是视频压缩），生成式 SeedVR2 约 4 s/帧不可用。
+# 想换参数改 run_mvp1.sh 的 VL_* 环境变量，这里刻意不暴露。
+set -uo pipefail
+
+DRY_RUN=0
+RECURSIVE=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run)      DRY_RUN=1; shift ;;
+        --no-recursive) RECURSIVE=0; shift ;;
+        -h|--help)      sed -n '2,28p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        --*)            echo "未知选项: $1" >&2; exit 1 ;;
+        *)              break ;;
+    esac
+done
+
+IN=${1:-}
+OUT_ARG=${2:-restored}
+[ -n "$IN" ] || { sed -n '2,28p' "$0" | sed 's/^# \?//'; exit 1; }
+[ -e "$IN" ] || { echo "错误: 输入不存在: $IN" >&2; exit 1; }
+
+# 主机相关的设置（节点名、唤醒命令）不写死在脚本里，放本地配置文件：
+#   ~/.config/videolab/config   形如  VL_NODE=...  /  VL_WAKE_CMD='...'
+# 环境变量优先于配置文件。没有唤醒命令时不做唤醒，只等节点自己上线。
+CONF=${VL_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/videolab/config}
+if [ -f "$CONF" ]; then
+    _env_node=${VL_NODE:-}; _env_wake=${VL_WAKE_CMD:-}
+    . "$CONF"
+    [ -n "$_env_node" ] && VL_NODE=$_env_node
+    [ -n "$_env_wake" ] && VL_WAKE_CMD=$_env_wake
+fi
+NODE=${VL_NODE:-gpu-node}
+WAKE_CMD=${VL_WAKE_CMD:-}
+STAGE=${VL_STAGE:-videolab/staging}    # GPU 节点上的暂存目录（相对家目录）
+JOB=$(date +%Y%m%d-%H%M%S)-$$
+# 认得的容器格式。刻意用白名单而不是"排除已知的非视频"：片库里混着
+# .exe/.img/.7z 是常态，黑名单迟早漏。
+EXTS='mkv|mp4|avi|ts|m2ts|mpg|mpeg|vob|wmv|mov|flv|rmvb|m4v'
+
+say()  { clr; printf '\033[1m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+# ---- 远端路径转义 ----
+# 远端路径会被 **远端登录 shell** 再解析一次。若远端登录 shell 是 zsh，
+# 于是 `[group]title.mp4` 里的 `[...]` 被当成字符类通配；匹配不到文件时
+# zsh 直接报 `no matches found` 并让 rsync 以 code 12 失败（实测，第一次
+# 真实跑就撞上）。空格、`*`、`?`、`$`、`(` 同理。
+#   - rsync：加 -s（--protect-args），路径不再过远端 shell
+#   - ssh  ：命令是字符串，必须自己包单引号；内部单引号按 '\'' 转义
+shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+# ---- 加权多阶段进度 ----
+# 权重按实测时间占比定，不是平均分。以一部 4.3 GB / 90 分钟的片子估：
+#   唤醒 ~15 s、上传 ~68 s、修复+编码 ~60 min、取回 ~50 s、校验几秒
+# 修复阶段是绝对大头，所以给 88%；其余按量级摊。
+# 分母（总帧数）由 run_mvp1.sh 用 TOTAL_FRAMES= 报出来 —— 它调 `vspipe -i`
+# 拿输出几何时顺带就有，不需要额外代价。
+W_WAKE=2; W_UPLOAD=5; W_RESTORE=88; W_FETCH=4; W_VERIFY=1
+
+# 呈现方式按「谁在看」自动选，不用手工切：
+#   stderr 是终端  -> 原地刷新的进度条，容器日志收起来（失败时再整段吐出来）
+#   stderr 被重定向 -> 每变化一次出一行 JOBPROGRESS，给 Web worker 解析
+# VL_PROGRESS=bar|lines 可以强制。
+JOB_START=$(date +%s)
+PROGRESS_MODE=${VL_PROGRESS:-auto}
+if [ "$PROGRESS_MODE" = auto ]; then
+    if [ -t 2 ]; then PROGRESS_MODE=bar; else PROGRESS_MODE=lines; fi
+fi
+# 清掉当前这行进度条，好让整行输出不跟它挤在一起。没画条时清空行也无害，
+# 所以不用记「刚才画没画」—— 那个状态在管道子 shell 里改了也传不回来。
+clr() { [ "$PROGRESS_MODE" = bar ] && printf '\r\033[K' >&2; return 0; }
+
+fmt_dur() {   # 秒 -> 0:07 或 1:02:03
+    local s=${1:-0}
+    if [ "$s" -ge 3600 ]; then printf '%d:%02d:%02d' $((s/3600)) $((s%3600/60)) $((s%60))
+    else printf '%d:%02d' $((s/60)) $((s%60)); fi
+}
+
+draw_bar() {   # $1=阶段名 $2=全局百分比
+    local stage=$1 gpct=$2 width=24 i filled bar=''
+    filled=$(( gpct * width / 100 ))
+    for ((i=0; i<width; i++)); do
+        if [ "$i" -lt "$filled" ]; then bar+='█'; else bar+='░'; fi
+    done
+    local elapsed eta=''
+    elapsed=$(( $(date +%s) - JOB_START ))
+    # 剩余时间是**外推**不是测量：拿已用时间按当前全局百分比线性放大。
+    # 门槛设在 10%：前面的唤醒/上传阶段又快又只占 7%，在那之前外推会得到
+    # 荒唐的数（实测 3% 时报 51 分钟，真实不到 2 分钟）。到 10% 时已经进了
+    # 修复阶段，而修复阶段内部速率是稳的，外推才有意义。
+    if [ "$gpct" -ge 10 ] && [ "$gpct" -lt 100 ] && [ "$elapsed" -gt 5 ]; then
+        eta="  余 ~$(fmt_dur $(( elapsed * (100 - gpct) / gpct )))"
+    fi
+    printf '\r  %s %s %3d%%  文件 %d/%d  已用 %s%s\033[K' \
+        "$stage" "$bar" "$gpct" "${done_n:-0}" "${todo:-1}" \
+        "$(fmt_dur $elapsed)" "$eta" >&2
+}
+# rsync --info=progress2 把「已传字节/总字节」的百分比写在 \r 分隔的同一行里。
+# 换成 \n 才能逐条读；退出码要从 PIPESTATUS[0] 取，不能取 sed/while 的。
+rsync_progress() {   # $1=阶段名，其余=rsync 参数
+    local stage=$1; shift
+    rsync -a -s --info=progress2 "$@" 2>&1 \
+      | tr '\r' '\n' \
+      | { while IFS= read -r line; do
+              case "$line" in
+                  *%*) pct=${line%%\%*}; pct=${pct##* }
+                       case "$pct" in
+                           ''|*[!0-9]*) clr; printf '%s\n' "$line" >&2 ;;
+                           *) [ "$pct" != "${lp:-}" ] && { emit_progress "$stage" "$pct"; lp=$pct; } ;;
+                       esac ;;
+                  *) [ -n "$line" ] && { clr; printf '%s\n' "$line" >&2; } ;;
+              esac
+          done
+          true; }   # true 必须在管道**内**：放外面会把 PIPESTATUS 重置成 0，
+                    # rsync 的失败就被吞掉了（实测踩过）
+    return "${PIPESTATUS[0]}"
+}
+
+emit_progress() {   # $1=阶段名 $2=该阶段内百分比(0-100)
+    local base=0
+    case "$1" in
+        唤醒)   base=0 ;;
+        上传)   base=$W_WAKE ;;
+        修复)   base=$((W_WAKE+W_UPLOAD)) ;;
+        取回)   base=$((W_WAKE+W_UPLOAD+W_RESTORE)) ;;
+        校验)   base=$((W_WAKE+W_UPLOAD+W_RESTORE+W_FETCH)) ;;
+    esac
+    local span
+    case "$1" in
+        唤醒) span=$W_WAKE ;; 上传) span=$W_UPLOAD ;; 修复) span=$W_RESTORE ;;
+        取回) span=$W_FETCH ;; 校验) span=$W_VERIFY ;;
+    esac
+    # overall = 本文件内的百分比；global = 跨全部文件的百分比。
+    # 进度条走 global，否则批处理时每个文件都从头爬一遍，看着像卡住又倒退。
+    local overall=$(( base + ${2:-0} * span / 100 ))
+    local finished=$(( ${done_n:-0} > 0 ? ${done_n:-0} - 1 : 0 ))
+    local global=$(( (finished * 100 + overall) / ${todo:-1} ))
+    [ "$global" -gt 100 ] && global=100
+    [ "$global" -lt 0 ] && global=0
+    if [ "$PROGRESS_MODE" = bar ]; then
+        draw_bar "$1" "$global"
+    else
+        printf 'JOBPROGRESS file=%d/%d stage=%s stage_pct=%s overall=%d global=%d\n' \
+            "${done_n:-0}" "${todo:-1}" "$1" "${2:-0}" "$overall" "$global"
+    fi
+}
+warn() { clr; printf '\033[33m[%s] %s\033[0m\n' "$(date +%H:%M:%S)" "$*" >&2; }
+
+# ---- 组装待处理清单 ----
+# 用 NUL 分隔，文件名里有空格/引号/换行都不会散架 —— 片名普遍带空格和
+# 方括号，按行读迟早出事。
+declare -a SRCS=()
+if [ -d "$IN" ]; then
+    IN_ROOT=$(cd "$IN" && pwd)
+    depth=(); [ "$RECURSIVE" = 0 ] && depth=(-maxdepth 1)
+    while IFS= read -r -d '' f; do SRCS+=("$f"); done < <(
+        find "$IN_ROOT" "${depth[@]}" \
+            -type f -regextype posix-extended -iregex ".*\.($EXTS)" -print0 2>/dev/null | sort -z
+    )
+else
+    IN_ROOT=$(cd "$(dirname "$IN")" && pwd)
+    SRCS=("$IN_ROOT/$(basename "$IN")")
+fi
+[ ${#SRCS[@]} -gt 0 ] || { echo "错误: 没有找到可处理的视频文件" >&2; exit 1; }
+
+mkdir -p "$OUT_ARG" || { echo "错误: 无法创建输出目录: $OUT_ARG" >&2; exit 1; }
+OUT_ROOT=$(cd "$OUT_ARG" && pwd)
+
+# 输入是目录时保留相对结构：两个季文件夹里都有 01.mkv，铺平会互相覆盖。
+# 返回**不含扩展名**的目标路径 —— 最终容器由 run_mvp1.sh 按流内容判定，
+# 这里不能预设是 .mkv 还是 .mp4。
+dest_base_of() {
+    local src=$1 rel
+    if [ -d "$IN" ]; then rel=${src#"$IN_ROOT"/}; else rel=$(basename "$src"); fi
+    printf '%s/%s' "$OUT_ROOT" "${rel%.*}"
+}
+
+# 分辨率上限预检。链路本体也会拦（restore_mvp1.vpy），但那要等到上传完、
+# 唤醒完、跑起来才报错 —— 批量时意味着传了几 GB 才发现不该传。这里先筛掉。
+# 「宽或高任一 > 1280」：竖屏 1080p 是 1080x1920，只看宽会放过去。
+# 1280 覆盖 DVD/VCD/720p，排除 1080p 及以上（后者属 MVP2，且设计上不超分）。
+MAX_DIM=${VL_MAX_DIM:-1280}
+too_large() {
+    local wh
+    wh=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+         -of csv=p=0 "$1" 2>/dev/null) || return 1
+    local w=${wh%%,*} h=${wh##*,}
+    [ -n "$w" ] && [ -n "$h" ] || return 1
+    [ "$w" -gt "$MAX_DIM" ] || [ "$h" -gt "$MAX_DIM" ]
+}
+
+# 已完成的判据要覆盖两种容器，否则上次出 .mp4、这次按 .mkv 找不到，
+# 会把已经跑完的片子重跑一遍（一部 90 分钟片约一小时）。
+existing_output() {
+    local base=$1 ext
+    for ext in mkv mp4; do
+        [ -s "$base.$ext" ] && { printf '%s.%s' "$base" "$ext"; return 0; }
+    done
+    return 1
+}
+
+# ---- 清单预览 / dry-run ----
+todo=0 skip=0 oversize=0
+declare -a OVERSIZE=()
+for src in "${SRCS[@]}"; do
+    if existing_output "$(dest_base_of "$src")" >/dev/null; then
+        skip=$((skip+1))
+    elif too_large "$src"; then
+        oversize=$((oversize+1)); OVERSIZE+=("${src#"$IN_ROOT"/}")
+    else
+        todo=$((todo+1))
+    fi
+done
+say "待处理 $todo 个，已存在跳过 $skip 个，超出分辨率上限 $oversize 个（共 ${#SRCS[@]}）"
+if [ "$oversize" -gt 0 ]; then
+    warn "以下文件宽或高大于 ${MAX_DIM}，不走修复档（1080p 以上属 MVP2，尚未实现）："
+    printf '    %s\n' "${OVERSIZE[@]}" >&2
+fi
+if [ "$DRY_RUN" = 1 ]; then
+    for src in "${SRCS[@]}"; do
+        b=$(dest_base_of "$src")
+        if too_large "$src"; then
+            printf '  [超限] %s\n' "${src#"$IN_ROOT"/}"
+        elif d=$(existing_output "$b"); then
+            printf '  [跳过] %s  （已有 %s）\n' "${src#"$IN_ROOT"/}" "$(basename "$d")"
+        else
+            printf '  [处理] %s\n          -> %s.{mp4|mkv}（容器按流内容判定）\n' "${src#"$IN_ROOT"/}" "$b"
+        fi
+    done
+    exit 0
+fi
+[ "$todo" -gt 0 ] || { say "没有需要处理的文件"; exit 0; }
+
+# 刻意不做容量检查也不发空间警告：存储空间管理不属于本工具的职责，
+# 由使用者自己安排。
+
+# ---- 收尾：只撤自己置的那份 keep-awake ----
+# /run/keep-awake 是全局单文件、没有引用计数；无条件删会把别人（另一个
+# restore-video、或手工跑的批处理）依赖的保护一起撤掉。自测时就这样干掉过
+# 一次正在跑的批处理。
+#
+# **远端暂存的清理按「那份东西还值不值钱」分，不按成功/失败分。**
+# 最早这里是无条件 `rm -rf`，一次失败连带删掉了仍然有用的产出，毁过一次数据；
+# 之后改成失败一律保留，结果又反过来：留下一堆半截文件，还提示"暂存已保留"
+# 让人去捞一个根本不存在或没用的东西。现在按分支判：
+#   上传失败 -> 半截副本，源在本机完好           -> 删
+#   修复失败 -> 半截产出，编码不可续跑           -> 删（连输入一起）
+#   路径未知 -> verify 已通过的成品，只是没解析出 -> 全留，打目录
+#   取回失败 -> verify 已通过的成品，只是传输断了 -> 留成品、删输入，给重传命令
+# 判据是 run_mvp1.sh 只在 verify_output 通过后才打印 OUTPUT=，所以后两个分支
+# 的远端文件一定是完整可用的，删掉等于白跑一小时 GPU。
+OWNS_KEEPAWAKE=0
+# 收尾时那个 rmdir 只在目录已空时成功。空了就说没了，别让人去找一个不存在的
+# 目录 ——「保留在 …/staging/xxx」而那里什么都没有，比不提示还费时间。
+STAGE_GONE=0
+cleanup() {
+    local rc=$?
+    if [ "$OWNS_KEEPAWAKE" = 1 ]; then
+        ssh -o ConnectTimeout=10 "$NODE" 'sudo rm -f /run/keep-awake' >/dev/null 2>&1 || true
+    fi
+    if [ "$rc" -ne 0 ]; then
+        if [ "$STAGE_GONE" = 1 ]; then
+            warn "异常退出（$rc）。远端暂存已清空。"
+        else
+            warn "异常退出（$rc）。远端暂存保留在 $NODE:~/$STAGE/$JOB，确认无用后自行删除"
+        fi
+    fi
+    return $rc
+}
+trap cleanup EXIT
+
+# ---- ① 唤醒 ----
+if ! ssh -o ConnectTimeout=8 "$NODE" true 2>/dev/null; then
+    if [ -n "$WAKE_CMD" ]; then
+        say "GPU 节点未响应，唤醒中…"
+        $WAKE_CMD >&2
+    else
+        say "GPU 节点未响应，等待其上线…（未配置 VL_WAKE_CMD，不做唤醒）"
+    fi
+    # 轮询而不是一次长阻塞：唤醒阶段的进度就是「第几次探活」。
+    # 这是实测量（尝试次数），映射成百分比用的 WAKE_TRIES 是假设上限，
+    # 不是测出来的耗时；探活成功就直接跳到 100，不会假装还在爬。
+    WAKE_TRIES=${VL_WAKE_TRIES:-20}
+    for i in $(seq 1 "$WAKE_TRIES"); do
+        ssh -o ConnectTimeout=3 "$NODE" true 2>/dev/null && break
+        emit_progress 唤醒 $(( i * 100 / WAKE_TRIES ))
+    done
+fi
+ssh "$NODE" "test -e /run/keep-awake" 2>/dev/null || OWNS_KEEPAWAKE=1
+ssh "$NODE" "sudo touch /run/keep-awake && mkdir -p $(shq "$STAGE/$JOB")" || {
+    echo "错误: 无法连接 $NODE" >&2; exit 1; }
+done_n=0; emit_progress 唤醒 100
+
+# ---- ② 逐个处理 ----
+# 单个失败不中断整批：批量跑十部片子要十小时，为第三部的坏文件放弃后七部不划算。
+# 失败的记下来最后统一报。
+declare -a FAILED=()
+done_n=0
+for src in "${SRCS[@]}"; do
+    dst=$(dest_base_of "$src").mkv    # 扩展名稍后按远端实际容器改写
+    rel=${src#"$IN_ROOT"/}
+    existing_output "$(dest_base_of "$src")" >/dev/null && continue
+    too_large "$src" && continue
+    done_n=$((done_n+1))
+    say "[$done_n/$todo] $rel（$(du -h "$src" | cut -f1)）"
+
+    base=$(basename "$src")
+    remote="$STAGE/$JOB/$base"
+    mkdir -p "$(dirname "$dst")"
+
+    emit_progress 上传 0
+    if ! rsync_progress 上传 "$src" "$NODE:$remote"; then
+        warn "上传失败，跳过: $rel"; FAILED+=("$rel（上传）")
+        # 半截的上传没有任何价值 —— 源文件在本机完好无损，这边留着只占空间，
+        # 下次还会整个重传。清掉。
+        ssh "$NODE" "rm -f $(shq "$remote")" >/dev/null 2>&1 || true
+        continue
+    fi
+    # **远端产出的扩展名由容器判定决定，不能在这里拼。** run_mvp1.sh 会按
+    # 「保留的流 MP4 能否无损承载」把 .mkv 改写成 .mp4（或反过来），所以让它
+    # 用 OUTPUT= 把最终路径报回来。写死 .out.mkv 会取不到文件（已踩过）。
+    #
+    # 日志落临时文件而不是用 $(...) 捕获：需要**边跑边报进度**，
+    # 命令替换要等进程结束才拿得到内容。
+    logf=$(mktemp); rc=0
+    ssh "$NODE" "
+            set -o pipefail
+            cd ~ && ./videolab/scripts/run_mvp1.sh $(shq "$remote") $(shq "$remote.out.mkv") \
+                ${VL_PRESET:+VL_PRESET=$VL_PRESET} \
+                ${VL_CONTAINER:+VL_CONTAINER=$VL_CONTAINER} \
+                VL_UPSCALE_MODEL=/models/openmodeldb/2xLiveActionV1_SPAN_490000.onnx
+        " 2>&1 | tee "$logf" | while IFS= read -r line; do
+            case "$line" in
+                TOTAL_FRAMES=*) total=${line#*=} ;;
+                PROGRESS_FRAME=*)
+                    f=${line#*=}
+                    if [ "${total:-0}" -gt 0 ] 2>/dev/null; then
+                        pct=$(( f * 100 / total )); [ "$pct" -gt 100 ] && pct=100
+                        [ "$pct" != "${lastpct:-}" ] && { emit_progress 修复 "$pct"; lastpct=$pct; }
+                    fi ;;
+                OUTPUT=*) ;;                     # 交给后面从日志里取
+                # 进度条模式下容器日志（vspipe 的 Information:、ffmpeg 的 banner）
+                # 收起来不刷屏 —— 但全量仍写进 $logf，失败时整段吐出来。
+                # **不能真吞掉**：一个静默失败没有日志就无从定位。
+                *) [ "$PROGRESS_MODE" = bar ] || printf '%s\n' "$line" >&2 ;;
+            esac
+        done
+    rc=${PIPESTATUS[0]:-0}
+    if [ "$rc" -ne 0 ]; then
+        warn "修复失败，跳过: $rel"; FAILED+=("$rel（修复）")
+        if [ "$PROGRESS_MODE" = bar ]; then
+            warn "以下是远端最后 30 行输出："
+            tail -30 "$logf" >&2
+        fi
+        rm -f "$logf"
+        # 输入 + **可能存在的半截产出**一起清。ffmpeg 是直接往 /out 写的，中途死
+        # 掉会留下一个不完整的文件，而编码不可续跑，留着没用还会让人误以为有成品。
+        # 名字只可能是这两个之一：run_mvp1.sh 拿到的输出名是 `<base>.out.mkv`，
+        # 容器判定只会把扩展名改写成 .mkv 或 .mp4，不会动主干。
+        ssh "$NODE" "rm -f $(shq "$remote") $(shq "$remote.out.mkv") $(shq "$remote.out.mp4")" \
+            >/dev/null 2>&1 || true
+        continue
+    fi
+    produced=$(sed -n 's/^OUTPUT=//p' "$logf" | tail -1); rm -f "$logf"
+    # 这里 rc=0，意味着 run_mvp1.sh 的 verify_output 已经通过 —— 远端**有一个完整
+    # 可用的成品**，只是没能把路径解析出来。一个字节都不能删，人工去捞。
+    [ -n "$produced" ] || { warn "未能确定远端产出路径，跳过: $rel"
+                            warn "  远端成品已通过验证但取不回来，自己去看: $NODE:~/$STAGE/$JOB/"
+                            FAILED+=("$rel（产出路径未知）"); continue; }
+    # 本地扩展名跟随远端实际容器
+    dst="${dst%.*}.${produced##*.}"
+    emit_progress 取回 0
+    # 先落到 .part 再改名：中途断了不会留下一个"看起来完成"的半截文件，
+    # 下次运行会重跑它而不是当成已完成跳过。
+    if ! rsync_progress 取回 "$NODE:$produced" "$dst.part"; then
+        warn "取回失败，跳过: $rel"; FAILED+=("$rel（取回）")
+        # 成品已通过验证，只是传输断了 —— 删它等于白跑一小时 GPU。保留成品，
+        # 但输入的那份副本没用了，清掉腾空间。重传命令直接给出来（-s 是必须的：
+        # 远端路径会被远端的 zsh 再解析一次，`[]`/空格会被当通配）。
+        ssh "$NODE" "rm -f $(shq "$remote")" >/dev/null 2>&1 || true
+        warn "  远端成品已保留，重传: rsync -a -s --info=progress2 $NODE:$(printf %q "$produced") $(printf %q "$dst")"
+        continue
+    fi
+    emit_progress 校验 100
+    mv -f "$dst.part" "$dst"
+    ssh "$NODE" "rm -f $(shq "$remote") $(shq "$produced")" >/dev/null 2>&1 || true
+    say "  -> $dst（$(du -h "$dst" | cut -f1)）"
+
+    # 原片处理。**修复模式默认保留** —— 修复输出像素数是源的 4 倍、成品通常
+    # 更大，删掉不省空间却永久失去原始素材。VL_RETIRE_SOURCE=1 显式开启，
+    # 开启后也是移入回收目录而非真删，且 retire-source.sh 会独立复核产出。
+    if [ "${VL_RETIRE_SOURCE:-0}" = 1 ]; then
+        "$(dirname "$0")/retire-source.sh" "$src" "$dst" || \
+            warn "原片退休被拒绝，已保留: $rel"
+    fi
+done
+
+# ---- ③ 汇总 ----
+ssh "$NODE" "rmdir $(shq "$STAGE/$JOB")" >/dev/null 2>&1 && STAGE_GONE=1
+ok=$((done_n - ${#FAILED[@]}))
+say "完成 $ok/$todo，输出在 $OUT_ROOT"
+if [ ${#FAILED[@]} -gt 0 ]; then
+    warn "失败 ${#FAILED[@]} 个："
+    printf '    %s\n' "${FAILED[@]}" >&2
+    exit 1
+fi

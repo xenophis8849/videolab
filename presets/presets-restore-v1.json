@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "_comment_schema": "与转码项目的 presets-v1.json 同一 schema，故意保持字段名一致，将来可合并成一份。合并的前提是给转码那批补上 node 字段并让 PresetRegistry.public() 按节点过滤 —— 现在它不做任何能力过滤，把 nvenc 档放进共享文件会让只有 VAAPI 的转码节点列出自己跑不了的档位。",
+  "calibration_status": "v1-calibrated-on-restore-output",
+  "_comment_calibration": "用 calibrate-nvenc.sh 在修复链的真实产出上校准（参照是修复输出的 ffv1 无损中间文件，不是源文件 —— 要评的是最后那步编码的损失）。锚点：hevc_nvenc 追平 SVT-AV1 preset4/crf26（一直在交付的那档）需要 +15~21% 码率，这是硬件编码器对好软件编码器的正常溢价。高质量档取 0.18 以在两份素材上都不低于该基准；另两档按约 2 dB 的感知间距下推。实测 XPSNR（逐行素材 / telecine 素材）：0.18≈39.2/34.8，0.11=37.10/33.30，0.07=35.00/31.85。各档间距均 > 0.5 dB 的肉眼可辨阈值。",
+  "presets": [
+    {
+      "id": "hevc-nvenc-sdr-high-v2",
+      "version": 2,
+      "label": "高质量",
+      "node": "gpu",
+      "description": "每像素比特上限 0.18；优先保留修复重建出的纹理",
+      "kind": "video",
+      "container": "auto",
+      "_comment_container": "不写死 mp4。容器由 stream-policy.sh 按「保留的流 MP4 能否无损承载」判定：能就 mp4，不能就 mkv。写死 mp4 会让带 ASS 的源在默认路径上静默损坏字幕排版。",
+      "video": {
+        "encoder": "hevc_nvenc",
+        "rate_control": "VBR",
+        "max_bits_per_pixel_frame": 0.18,
+        "codec": "hevc",
+        "nvenc_preset": "p6",
+        "tune": "hq",
+        "profile": "main10"
+      },
+      "_comment_no_size_ratio": "刻意不含 target_total_size_ratio。转码用它（成品相对源文件的倍数）是合理的，但修复输出的像素数是源的 4 倍，按源文件大小卡码率等于把刚重建出来的细节再压回去。",
+      "audio": {
+        "encoder": "aac",
+        "base_bitrate": "224k",
+        "scale_by_channels": true,
+        "_comment": "224k 是转码为立体声定的基准。逐轨按各自声道数缩放：1-2ch 224k / 3-6ch 448k / 更多 640k，且上限不超过源码率。不下混（不设 -ac）。"
+      },
+      "validation": {
+        "require_faststart": true,
+        "duration_tolerance_seconds": 0.25
+      }
+    },
+    {
+      "id": "hevc-nvenc-sdr-standard-v2",
+      "version": 2,
+      "label": "标准",
+      "node": "gpu",
+      "description": "每像素比特上限 0.11；画质与体积平衡",
+      "kind": "video",
+      "container": "auto",
+      "video": {
+        "encoder": "hevc_nvenc",
+        "rate_control": "VBR",
+        "max_bits_per_pixel_frame": 0.11,
+        "codec": "hevc",
+        "nvenc_preset": "p6",
+        "tune": "hq",
+        "profile": "main10"
+      },
+      "audio": {
+        "encoder": "aac",
+        "base_bitrate": "224k",
+        "scale_by_channels": true
+      },
+      "validation": {
+        "require_faststart": true,
+        "duration_tolerance_seconds": 0.25
+      }
+    },
+    {
+      "id": "hevc-nvenc-sdr-compact-v2",
+      "version": 2,
+      "label": "节省空间",
+      "node": "gpu",
+      "description": "每像素比特上限 0.07；体积优先",
+      "kind": "video",
+      "container": "auto",
+      "video": {
+        "encoder": "hevc_nvenc",
+        "rate_control": "VBR",
+        "max_bits_per_pixel_frame": 0.07,
+        "codec": "hevc",
+        "nvenc_preset": "p6",
+        "tune": "hq",
+        "profile": "main10"
+      },
+      "audio": {
+        "encoder": "aac",
+        "base_bitrate": "224k",
+        "scale_by_channels": true
+      },
+      "validation": {
+        "require_faststart": true,
+        "duration_tolerance_seconds": 0.25
+      }
+    },
+    {
+      "id": "svtav1-archive-v1",
+      "version": 1,
+      "label": "归档母版（AV1）",
+      "node": "gpu",
+      "description": "SVT-AV1 preset 4 / crf 26，CPU 编码，同码率质量优于硬件 HEVC；不与转码统一，仅供归档",
+      "kind": "video",
+      "container": "auto",
+      "video": {
+        "encoder": "libsvtav1",
+        "rate_control": "CRF",
+        "crf": 26,
+        "svt_preset": 4,
+        "codec": "av1"
+      },
+      "_comment_deviation": "这一档刻意偏离「与转码统一」的约束，保留作对照与归档用途。默认不用。实测端到端 1.35x 实时，瓶颈在 CPU 编码器（43 fps）。",
+      "audio": {
+        "encoder": "aac",
+        "base_bitrate": "224k",
+        "scale_by_channels": true
+      },
+      "validation": {
+        "require_faststart": true,
+        "duration_tolerance_seconds": 0.25
+      }
+    }
+  ]
+}

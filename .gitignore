@@ -1,0 +1,20 @@
+# Test sources, intermediates and outputs — reproducible, and local material
+/src/
+/work/
+/out/
+/restored/
+/cache/
+/models/
+
+# Internal working notes, kept locally but not published
+/PROJECT_SUMMARY.md
+/STATE.md
+/UNIFIED_ENCODING_PLAN.md
+
+/tmp/
+*.log
+
+.DS_Store
+*.swp
+__pycache__/
+*.pyc
