@@ -153,6 +153,43 @@ viewing copy, not for an archival master.
   It also does not denoise, so heavy grain should be handled before it, and the
   author of the model states it does not address VHS degradation.
 
+## Acknowledgements
+
+Almost everything that does the actual work here belongs to someone else. This
+project is orchestration — a chain, a container and a set of measured choices —
+on top of:
+
+- **[VapourSynth](https://github.com/vapoursynth/vapoursynth)** — the frame
+  server the whole pipeline is built on, and `vspipe`, which makes the streaming
+  design possible.
+- **[JET (Jaded Encoding Thaumaturgy)](https://github.com/Jaded-Encoding-Thaumaturgy)**
+  — `vsjetpack` and its component packages (`vsscale`, `vstools`, `vssource`,
+  `vsdeinterlace`, `vskernels`, `vsdenoise`), plus the wheel index that turns a
+  six-round source build into one `pip install`. `BestSource` comes from here too.
+- **[vs-mlrt](https://github.com/AmusementClub/vs-mlrt)** (AmusementClub) — the
+  TensorRT / ONNX Runtime / ncnn / OpenVINO inference backends.
+- **[NVIDIA TensorRT](https://developer.nvidia.com/tensorrt)** — fp16 engine
+  building and inference.
+- **DPIR** — *Plug-and-Play Image Restoration with Deep Denoiser Prior*
+  (Kai Zhang et al.); the `drunet` deblocking weights are step ④ of the chain.
+- **[2xLiveActionV1_SPAN](https://github.com/jcj83429/upscaling)** (jcj83429) —
+  the 1.6 MB upscale model that won the comparison, trained on exactly the
+  degradations this pipeline sees. The SPAN architecture it uses comes from
+  *Swift Parameter-free Attention Network for Efficient Super-Resolution*.
+- **QTGMC** — the deinterlacer, originally written for AviSynth by Vit on top of
+  Didée's TGMC, and reachable here through `vsdeinterlace`.
+- **VIVTC** — VapourSynth's inverse-telecine pair (`VFM` / `VDecimate`), itself a
+  port of tritical's TIVTC. The cadence logic in this project is only reading
+  what `VFM` already figured out.
+- **[FFmpeg](https://ffmpeg.org/)**, **[SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1)**
+  and **[BtbN's FFmpeg builds](https://github.com/BtbN/FFmpeg-Builds)** — encoding,
+  stream handling, and a static build that actually ships `av1_nvenc`.
+- **[zimg](https://github.com/sekrit-twc/zimg)** (sekrit-twc) — the resampling and
+  colour conversion underneath every scale and matrix change in the chain.
+
+Exact versions of everything installed are pinned in
+`docker/vsgpu/requirements.lock.txt`.
+
 ## License
 
 MIT. See `LICENSE`.
